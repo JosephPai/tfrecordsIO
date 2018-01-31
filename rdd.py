@@ -18,7 +18,6 @@ import shutil
 import heapq
 import struct
 import traceback
-import crcmod
 
 try:
     from cStringIO import StringIO
@@ -424,6 +423,9 @@ class RDD(object):
 
     def saveAsTextFile(self, path, ext='', overwrite=True, compress=False):
         return OutputTextFileRDD(self, path, ext, overwrite, compress=compress).collect()
+
+    def saveAsTfrecordsFile(self, path, ext='', overwrite=True, compress=False):
+        return OutputTfrecordstFileRDD(self, path, ext, overwrite, compress=compress).collect()
 
     def saveAsTextFileByKey(self, path, ext='', overwrite=True, compress=False):
         return MultiOutputTextFileRDD(self, path, ext, overwrite, compress=compress).collect()
@@ -1460,7 +1462,6 @@ class TextFileRDD(RDD):
             start += size
             if start >= end: break
 
-
 class TfrecordsRDD(TextFileRDD):
 
     def __init__(self, ctx, path, numSplits=None, splitSize=None):
@@ -1472,10 +1473,10 @@ class TfrecordsRDD(TextFileRDD):
             end = split.end
             if start > 0:
                 # modified below
-                check, size = self.check_split_point(f, start)
+                check = self.check_split_point(f, start)
                 while not check:
-                    check, size = self.check_split_point(f, start)
                     start += 1
+                    check = self.check_split_point(f, start)
 
             if start >= end:
                 return
@@ -1485,9 +1486,7 @@ class TfrecordsRDD(TextFileRDD):
 
     def read(self, f, start, end):
         while start < end:
-            check, size = self.check_split_point(f, start)
-            f.seek(start)
-            record = f.read(size)
+            record, size = self.get_single_record(f, start)
             yield record
             start += size
 
@@ -1499,37 +1498,41 @@ class TfrecordsRDD(TextFileRDD):
             raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
         length, length_mask_expected = struct.unpack('<QI', buf)
         length_mask_actual = self._masked_crc32c(buf[:8])
+        return length_mask_actual == length_mask_expected
+
+    def get_single_record(self, f, point):
+        f.seek(point)
+        buf_length_expected = 12
+        buf = f.read(buf_length_expected)
+        record = buf
+        if len(buf) != buf_length_expected:
+            raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
+        length, length_mask_expected = struct.unpack('<QI', buf)
+        length_mask_actual = self._masked_crc32c(buf[:8])
         if length_mask_actual == length_mask_expected:
             # data verification
             buf_length_expected = length + 4
             buf = f.read(buf_length_expected)
+            record += buf
             if len(buf) != buf_length_expected:
                 raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
             data, data_mask_expected = struct.unpack('<%dsI' % length, buf)
             data_mask_actual = self._masked_crc32c(data)
             if data_mask_actual == data_mask_expected:
-                return True, self.encoded_num_bytes(data)
+                return record, len(data)+16
             else:
-                print("data loss...")   # Note: Pending
+                logger.error("data loss!!!")  # Note: Pending
         else:
-            return False, 0
+            return None, 0
 
-    def _default_crc32c_fn(self, value):
+    def _default_crc32c_fn(value):
+        import crcmod
         _default_crc32c_fn_fn = crcmod.predefined.mkPredefinedCrcFun('crc-32c')
         return _default_crc32c_fn_fn(value)
 
     def _masked_crc32c(self, value, crc32c_fn=_default_crc32c_fn):
         crc = crc32c_fn(value)
-        """ Some alternative methods """
-        # crc = zlib.crc32(value)
-        # crc = binascii.crc32(value)
         return (((crc >> 15) | (crc << 17)) + 0xa282ead8) & 0xffffffff
-
-    def encoded_num_bytes(self, record):
-        """Return the number of bytes consumed by a record in its encoded form."""
-        # 16 = 8 (Length) + 4 (crc of length) + 4 (crc of data)
-        return len(record) + 16
-
 
 class PartialTextFileRDD(TextFileRDD):
     def __init__(self, ctx, path, firstPos, lastPos, splitSize=None, numSplits=None):
@@ -1936,6 +1939,29 @@ class OutputTextFileRDD(DerivedRDD):
                 f.close()
 
         return not empty
+
+class OutputTfrecordstFileRDD(OutputTextFileRDD):
+    def __init__(self, rdd, path, ext, overwrite=True, compress=False):
+        OutputTextFileRDD.__init__(self, rdd=rdd, path=path, ext='.tfrecords', overwrite=overwrite, compress=compress)
+
+    def writedata(self, f, strings):
+        empty = True
+        for string in strings:
+            string_bytes = string.encode()
+            encoded_length = struct.pack('<Q', len(string_bytes))
+            f.write(encoded_length + struct.pack('<I', self._masked_crc32c(encoded_length)) +
+                       string_bytes + struct.pack('<I', self._masked_crc32c(string_bytes)))
+            empty = False
+        return not empty
+
+    def _default_crc32c_fn(value):
+        import crcmod
+        _default_crc32c_fn_fn = crcmod.predefined.mkPredefinedCrcFun('crc-32c')
+        return _default_crc32c_fn_fn(value)
+
+    def _masked_crc32c(self, value, crc32c_fn=_default_crc32c_fn):
+        crc = crc32c_fn(value)
+        return (((crc >> 15) | (crc << 17)) + 0xa282ead8) & 0xffffffff
 
 class MultiOutputTextFileRDD(OutputTextFileRDD):
     MAX_OPEN_FILES = 512
