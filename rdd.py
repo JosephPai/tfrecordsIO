@@ -1473,29 +1473,29 @@ class TfrecordsRDD(TextFileRDD):
             end = split.end
             if start > 0:
                 # modified below
-                check = self.check_split_point(f, start)
-                while not check:
+                while not self.check_split_point(f, start):
                     start += 1
-                    check = self.check_split_point(f, start)
+                    if start >= end:
+                        logger.info("End Of File")
+                        return
 
             if start >= end:
                 return
 
-            for l in self.read(f, start, end):
-                yield l
-
-    def read(self, f, start, end):
-        while start < end:
-            record, size = self.get_single_record(f, start)
-            yield record
-            start += size
+            while start < end:
+                record, size = self.get_single_record(f, start)
+                yield record
+                start += size
 
     def check_split_point(self, f, point):
         f.seek(point)
         buf_length_expected = 12
         buf = f.read(buf_length_expected)
+        if not buf:
+            logger.info("End Of File")
+            return False
         if len(buf) != buf_length_expected:
-            raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
+            return False
         length, length_mask_expected = struct.unpack('<QI', buf)
         length_mask_actual = self._masked_crc32c(buf[:8])
         return length_mask_actual == length_mask_expected
@@ -1504,7 +1504,6 @@ class TfrecordsRDD(TextFileRDD):
         f.seek(point)
         buf_length_expected = 12
         buf = f.read(buf_length_expected)
-        record = buf
         if len(buf) != buf_length_expected:
             raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
         length, length_mask_expected = struct.unpack('<QI', buf)
@@ -1513,13 +1512,12 @@ class TfrecordsRDD(TextFileRDD):
             # data verification
             buf_length_expected = length + 4
             buf = f.read(buf_length_expected)
-            record += buf
             if len(buf) != buf_length_expected:
                 raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
             data, data_mask_expected = struct.unpack('<%dsI' % length, buf)
             data_mask_actual = self._masked_crc32c(data)
             if data_mask_actual == data_mask_expected:
-                return record, len(data)+16
+                return data.decode(), len(data)+16
             else:
                 logger.error("data loss!!!")  # Note: Pending
         else:
@@ -1947,7 +1945,7 @@ class OutputTfrecordstFileRDD(OutputTextFileRDD):
     def writedata(self, f, strings):
         empty = True
         for string in strings:
-            string_bytes = string.encode()
+            string_bytes = str(string).encode()
             encoded_length = struct.pack('<Q', len(string_bytes))
             f.write(encoded_length + struct.pack('<I', self._masked_crc32c(encoded_length)) +
                        string_bytes + struct.pack('<I', self._masked_crc32c(string_bytes)))
