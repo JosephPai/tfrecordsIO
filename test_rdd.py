@@ -338,27 +338,25 @@ class TestRDD(unittest.TestCase):
                 [os.path.join(path, '0000.csv')])
 
     def test_tfrecord(self):
+        N = 1000
+        d = self.sc.makeRDD(list(("the %d string" % i) for i in range(N)), 1)
+        with temppath("tfout") as path:
+            self.assertEqual(d.saveAsTFRecordsFile(path),
+                             [os.path.join(path, '0000.tfrecords')])
+            rd = self.sc.tfRecordsFile(path)
+            self.assertEqual(rd.count(), N)
+            prefix = 'prefix:'
+            self.assertEqual(d.map(lambda x: prefix + x).saveAsTFRecordsFile(path),
+                             [os.path.join(path, '0000.tfrecords')])
+            rd = self.sc.tfRecordsFile(path, splitSize=1<<10)
+            self.assertEqual(rd.count(), N)
 
-        def write_single_record(fh, stringvalue):
-            string_bytes = stringvalue.encode()
-            encoded_length = struct.pack('<Q', len(string_bytes))
-            fh.write(encoded_length + struct.pack('<I', TfrecordsRDD._masked_crc32c(encoded_length))
-                            + string_bytes + struct.pack('<I', TfrecordsRDD._masked_crc32c(string_bytes)))
-
-        with temppath('tfrcd') as path:
-            with open(path+'/records','wb') as fh:
-                for i in range(40):
-                    write_single_record(fh, "this it the %d string" % i)
-                rd = self.sc.tfrecordsFile(path)
-                self.assertEqual(rd.count(), 40)
-
-        with temppath('tfrcd') as path:
-            with open(path + '/records', 'wb') as fh:
-                fh.write(b"errortest")
-            rd = self.sc.tfrecordsFile(path)
-            rd.count()
-            self.assertRaises(ValueError)
-
+        d = self.sc.makeRDD(list(range(N)), 1)
+        with temppath('tfout') as path:
+            self.assertEqual(d.saveAsTFRecordsFile(path), [os.path.join(path, '0000.tfrecords')])
+            rd = self.sc.tfRecordsFile(path, splitSize=1<<10)
+            self.assertEqual(rd.count(), N)
+            self.assertEqual(rd.map(lambda x: int(x)).reduce(lambda x, y: x + y), sum(range(N)))
 
     def test_compressed_file(self):
         # compress
@@ -374,6 +372,14 @@ class TestRDD(unittest.TestCase):
                 [os.path.join(path, 'x/0000.gz')])
             rd = self.sc.textFile(path, splitSize=10<<10)
             self.assertEqual(rd.count(), 100000)
+
+    # def test_compressed_tfrecords(self):
+    #     d = self.sc.makeRDD(list(("the %d string" % i) for i in range(1000)), 1)
+    #     with temppath('tout') as path:
+    #         self.assertEqual(d.saveAsTfrecordsFile(path, compress=True),
+    #                          [os.path.join(path, '0000.tfrecords.gz')])
+    #         rd = self.sc.tfrecordsFile(path, splitSize = 2<<10)
+    #         self.assertEqual(rd.count(), 1000)
 
     def test_large_txt_file(self):
         with gen_big_text_file(64 << 10, 5 << 20, ext='txt') as f:
