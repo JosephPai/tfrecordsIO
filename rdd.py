@@ -34,7 +34,7 @@ except ImportError:
 from dpark.dependency import *
 from dpark.util import (
     spawn, chain, mkdir_p, recurion_limit_breaker, atomic_file,
-    AbortFileReplacement, get_logger, portable_hash, _default_crc32c_fn
+    AbortFileReplacement, get_logger, portable_hash, masked_crc32c, gzip_decompressed_fh
 )
 from dpark.shuffle import (
     Merger, CoGroupMerger, SortedShuffleFetcher, SortedMerger, CoGroupSortedMerger,
@@ -96,6 +96,8 @@ class RDD(object):
         ctx.init()
         self.err = ctx.options.err
         self.mem = ctx.options.mem
+        self.cpus = 0
+        self.gpus = 0
         self._preferred_locs = {}
         self.repr_name = '<%s>' % (self.__class__.__name__,)
         self._get_scope()
@@ -341,6 +343,8 @@ class RDD(object):
                     return [reduce(f, it)]
                 except TypeError as e:
                     empty_msg = 'reduce() of empty sequence with no initial value'
+                    if not six.PY2:
+                        e.message = str(e)
                     if e.message == empty_msg:
                         return []
                     else:
@@ -810,11 +814,26 @@ class RDD(object):
             .mapValue(_)
 
 
+    def with_cpus(self, cpus):
+        self.cpus = cpus
+        return self
+
+    def with_gpus(self, gpus):
+        self.gpus = gpus
+        return self
+
+    def with_mem(self, mem):
+        self.mem = mem
+        return self
+
+
 class DerivedRDD(RDD):
     def __init__(self, rdd):
         RDD.__init__(self, rdd.ctx)
         self.prev = rdd
         self.mem = max(self.mem, rdd.mem)
+        self.cpus = rdd.cpus
+        self.gpus = rdd.gpus
         self._dependencies = [OneToOneDependency(rdd)]
         self._splits = self.prev.splits
         self._preferred_locs = self.prev._preferred_locs
@@ -1095,6 +1114,15 @@ class CartesianRDD(RDD):
             rdd2.mem * 1.5,
             self.cache_memory * 2.5
         ))
+        self.cpus = max(
+            rdd1.cpus,
+            rdd2.cpus
+        )
+        self.gpus = int(max(
+            rdd1.gpus,
+            rdd2.gpus
+        ))
+
         self.numSplitsInRdd2 = n = len(rdd2)
         self._splits = [CartesianSplit(s1.index*n+s2.index, s1, s2)
             for s1 in rdd1.splits for s2 in rdd2.splits]
@@ -1284,7 +1312,11 @@ class UnionSplit(Split):
 class UnionRDD(RDD):
     def __init__(self, ctx, rdds):
         RDD.__init__(self, ctx)
-        self.mem = rdds[0].mem if rdds else self.mem
+        if rdds:
+            self.mem = max(rdd.mem for rdd in rdds)
+            self.cpus = max(rdd.cpus for rdd in rdds)
+            self.gpus = max(rdd.cpus for rdd in rdds)
+
         pos = 0
         for rdd in rdds:
             self._splits.extend([UnionSplit(pos + i, rdd, sp) for i, sp in enumerate(rdd.splits)])
@@ -1303,6 +1335,8 @@ class SliceRDD(RDD):
         RDD.__init__(self, rdd.ctx)
         self.rdd = rdd
         self.mem = rdd.mem
+        self.cpus = rdd.cpus
+        self.gpus = rdd.gpus
         if j > len(rdd):
             j = len(rdd)
         self.i = i
@@ -1336,6 +1370,8 @@ class MergedRDD(RDD):
         numSplits = (len(rdd) + splitSize - 1) // splitSize
         self.rdd = rdd
         self.mem = rdd.mem
+        self.cpus = rdd.cpus
+        self.gpus = rdd.gpus
         self.splitSize = splitSize
         self.numSplits = numSplits
 
@@ -1363,6 +1399,8 @@ class ZippedRDD(RDD):
         RDD.__init__(self, ctx)
         self.rdds = rdds
         self.mem = max(r.mem for r in rdds)
+        self.cpus = max(r.cpus for r in rdds)
+        self.gpus = max(r.gpus for r in rdds)
         self._splits = [MultiSplit(i, splits)
                 for i, splits in enumerate(zip(*[rdd.splits for rdd in rdds]))]
         self._dependencies = [OneToOneDependency(rdd) for rdd in rdds]
@@ -1578,49 +1616,67 @@ class TextFileRDD(RDD):
 
 class TfrecordsRDD(TextFileRDD):
 
+    DEFAULT_READ_SIZE = 1 << 10
+    BLOCK_SIZE = 64 << 10
+
     def __init__(self, ctx, path, numSplits=None, splitSize=None):
         TextFileRDD.__init__(self, ctx, path, numSplits, splitSize)
 
     def compute(self, split):
         with closing(self.open_file()) as f:
-            start = split.begin
-            end = split.end
-            if start > 0:
-                # modified below
-                f.seek(start)
-                buffer = f.read(end-start)
+            if self.path.endswith('.gz'):
+                for fh in gzip_decompressed_fh(f, self.path, split, self.splitSize):
+                    for rcd in self.compute_with_fh(fh, 0, float('inf')):
+                        yield rcd
+            else:
+                start = split.begin
+                end = split.end
+                for rcd in self.compute_with_fh(f, start, end):
+                    yield rcd
+
+    def compute_with_fh(self, f, start, end):
+        if start >= 0:
+            f.seek(start)
+            buffer = f.read(min(self.DEFAULT_READ_SIZE, end - f.tell()))
+            while start < end:
                 cursor = 0
-                while cursor < (end-start) and not self.check_split_point(buffer[cursor:cursor + 12]):
+                while cursor < len(buffer) - 11 and not self.check_split_point(buffer[cursor:cursor + 12]):
                     cursor += 1
                 start += cursor
-
-            if start >= end:
+                if cursor == len(buffer) - 11:
+                    start += 11
+                    buffer = buffer[-11:] + f.read(min(self.DEFAULT_READ_SIZE, end - f.tell()))
+                else:
+                    break
+        if start >= end:
+            return
+        f.seek(start)
+        while start < end:
+            record = self.get_single_record(f)
+            if record is None:
                 return
-
-            f.seek(start)
-            while start < end:
-                record = self.get_single_record(f)
-                yield record
-                start += len(record)+16
+            yield record
+            start += len(record) + 16
 
     def check_split_point(self, buf):
         buf_length_expected = 12
         if not buf:
-
             return False
         if len(buf) != buf_length_expected:
             return False
         length, length_mask_expected = struct.unpack('<QI', buf)
-        length_mask_actual = self._masked_crc32c(buf[:8])
+        length_mask_actual = masked_crc32c(buf[:8])
         return length_mask_actual == length_mask_expected
 
     def get_single_record(self, f):
         buf_length_expected = 12
         buf = f.read(buf_length_expected)
+        if not buf:
+            return None
         if len(buf) != buf_length_expected:
             raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
         length, length_mask_expected = struct.unpack('<QI', buf)
-        length_mask_actual = self._masked_crc32c(buf[:8])
+        length_mask_actual = masked_crc32c(buf[:8])
         if length_mask_actual == length_mask_expected:
             # data verification
             buf_length_expected = length + 4
@@ -1628,7 +1684,7 @@ class TfrecordsRDD(TextFileRDD):
             if len(buf) != buf_length_expected:
                 raise ValueError('Not a valid TFRecord. Fewer than %d bytes: %s' % (buf_length_expected, buf))
             data, data_mask_expected = struct.unpack('<%dsI' % length, buf)
-            data_mask_actual = self._masked_crc32c(data)
+            data_mask_actual = masked_crc32c(data)
             if data_mask_actual == data_mask_expected:
                 return data.decode()
             else:
@@ -1636,9 +1692,6 @@ class TfrecordsRDD(TextFileRDD):
         else:
             return None
 
-    def _masked_crc32c(self, value, crc32c_fn=_default_crc32c_fn):
-        crc = crc32c_fn(value)
-        return (((crc >> 15) | (crc << 17)) + 0xa282ead8) & 0xffffffff
 
 class PartialTextFileRDD(TextFileRDD):
     def __init__(self, ctx, path, firstPos, lastPos, splitSize=None, numSplits=None):
@@ -2055,14 +2108,33 @@ class OutputTfrecordstFileRDD(OutputTextFileRDD):
         for string in strings:
             string_bytes = str(string).encode()
             encoded_length = struct.pack('<Q', len(string_bytes))
-            f.write(encoded_length + struct.pack('<I', self._masked_crc32c(encoded_length)) +
-                       string_bytes + struct.pack('<I', self._masked_crc32c(string_bytes)))
+            f.write(encoded_length + struct.pack('<I', masked_crc32c(encoded_length)) +
+                       string_bytes + struct.pack('<I', masked_crc32c(string_bytes)))
             empty = False
         return not empty
 
-    def _masked_crc32c(self, value, crc32c_fn=_default_crc32c_fn):
-        crc = crc32c_fn(value)
-        return (((crc >> 15) | (crc << 17)) + 0xa282ead8) & 0xffffffff
+    def write_compress_data(self, f, strings):
+        empty = True
+        with gzip.GzipFile(filename='', mode='wb', fileobj=f) as f:
+            size = 0
+            for string in strings:
+                string_bytes = str(string).encode()
+                encoded_length = struct.pack('<Q', len(string_bytes))
+                f.write(encoded_length + struct.pack('<I', masked_crc32c(encoded_length)) +
+                        string_bytes + struct.pack('<I', masked_crc32c(string_bytes)))
+                size += len(str(string)) + 16
+                if size >= 256 << 10:
+                    f.flush()
+                    f.compress = zlib.compressobj(9, zlib.DEFLATED,
+                                                  -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+                    size = 0
+                empty = False
+            if not empty:
+                f.flush()
+            if not six.PY2:
+                f.close()
+        return not empty
+
 
 class MultiOutputTextFileRDD(OutputTextFileRDD):
     MAX_OPEN_FILES = 512
