@@ -9,9 +9,10 @@ import uuid
 import time
 import tempfile
 import logging
-from contextlib import contextmanager
+import os.path
 import gzip
 import zlib
+from contextlib import contextmanager
 from zlib import compress as _compress
 try:
     from dpark.portable_hash import portable_hash as _hash
@@ -19,6 +20,12 @@ except ImportError:
     import pyximport
     pyximport.install(inplace=True)
     from dpark.portable_hash import portable_hash as _hash
+
+try:
+    from cStringIO import StringIO
+    BytesIO = StringIO
+except ImportError:
+    from six import BytesIO, StringIO
 
 try:
     import pwd
@@ -42,12 +49,6 @@ except ImportError:
         COMPRESS = 'snappy'
     except ImportError:
         pass
-
-try:
-    from cStringIO import StringIO
-    BytesIO = StringIO
-except ImportError:
-    from six import BytesIO, StringIO
 
 def spawn(target, *args, **kw):
     t = threading.Thread(target=target, name=target.__name__, args=args, kwargs=kw)
@@ -342,15 +343,7 @@ def gzip_find_block(f, pos):
 
 logger = get_logger(__name__)
 
-'''
-NOTE:
-利用stringIO(bytesIO),先找到start block, 顺序往下读，读一个block就解压，写入IO buffer中
-读到end block时候，每一个block yield出一个小的io buffer，调用check_split_point
-如果这一bolck没有找到point，那就继续读下一个block（当前block仍旧写入IO buffer),直到找到point
-global IO buffer seek回开头，传给RDD
 
-因为有可能出现example(TFRecords)长度大于block size
-'''
 def gzip_decompressed_fh(f, path, split, splitSize):
     if split.index == 0:
         zf = gzip.GzipFile(mode='rb', fileobj=f)
@@ -394,3 +387,31 @@ def gzip_decompressed_fh(f, path, split, splitSize):
             zf.close()
             dz = zlib.decompressobj(-zlib.MAX_WBITS)
             start -= f.tell()
+
+
+src_dir = os.path.dirname(os.path.abspath(__file__))
+STACK_FILE_NAME = 0
+STACK_LINE_NUM = 1
+STACK_FUNC_NAME = 2
+
+
+def get_user_call_site():
+    import traceback
+    stack = traceback.extract_stack(sys._getframe())
+    for i in range(1, len(stack)):
+        callee_path = stack[i][STACK_FILE_NAME]
+        if src_dir == os.path.dirname(os.path.abspath(callee_path)):
+            caller_path = stack[i-1][STACK_FILE_NAME]
+            caller_lineno = stack[i-1][STACK_LINE_NUM]
+            dpark_func_name = stack[i][STACK_FUNC_NAME]
+            user_call_site = '%s:%d ' % (caller_path, caller_lineno)
+            return dpark_func_name, user_call_site
+    return "<func>", " <root>"
+
+
+class Scope(object):
+    def __init__(self):
+        fn, pos = get_user_call_site()
+        self.dpark_func_name = fn
+        self.call_site = "@".join([fn, pos])
+

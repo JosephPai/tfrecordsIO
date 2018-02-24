@@ -34,10 +34,11 @@ except ImportError:
 from dpark.dependency import *
 from dpark.util import (
     spawn, chain, mkdir_p, recurion_limit_breaker, atomic_file,
-    AbortFileReplacement, get_logger, portable_hash, masked_crc32c, gzip_decompressed_fh
+    AbortFileReplacement, get_logger, portable_hash, Scope, masked_crc32c, gzip_decompressed_fh
 )
 from dpark.shuffle import (
     Merger, CoGroupMerger, SortedShuffleFetcher, SortedMerger, CoGroupSortedMerger,
+    OrderedMerger, OrderedCoGroupMerger,
     SortedGroupMerger, StreamCoGroupSortedMerger,
 )
 from dpark.env import env
@@ -71,17 +72,6 @@ def cached(func):
     return getstate
 
 
-STACK_FILE_NAME = 0
-STACK_LINE_NUM = 1
-STACK_FUNC_NAME = 2
-
-
-class Scope(object):
-    def __init__(self):
-        self.__name__ = None
-        self.call_site = None
-
-
 class RDD(object):
     def __init__(self, ctx):
         self.ctx = ctx
@@ -100,27 +90,7 @@ class RDD(object):
         self.gpus = 0
         self._preferred_locs = {}
         self.repr_name = '<%s>' % (self.__class__.__name__,)
-        self._get_scope()
-
-    def _get_scope(self):
-        stack = traceback.extract_stack(sys._getframe())
-        idx = len(stack) - 1
         self.scope = Scope()
-        for i in range(len(stack) - 1, -1, -1):
-            if stack[i][STACK_FUNC_NAME] == '__init__':
-                idx = i
-                break
-        for i in range(idx, -1, -1):
-            if stack[i][STACK_FUNC_NAME] != '__init__':
-                self.scope.__name__ = stack[i][STACK_FUNC_NAME]
-                if i > 0:
-                    self.scope.call_site = '%s at %s : %s ' % \
-                                           (self.scope.__name__,
-                                            stack[i - 1][STACK_FILE_NAME],
-                                            str(stack[i - 1][STACK_LINE_NUM]))
-                else:
-                    self.scope.call_site = '<root>'
-                break
 
     nextId = 0
 
@@ -343,8 +313,6 @@ class RDD(object):
                     return [reduce(f, it)]
                 except TypeError as e:
                     empty_msg = 'reduce() of empty sequence with no initial value'
-                    if not six.PY2:
-                        e.message = str(e)
                     if e.message == empty_msg:
                         return []
                     else:
@@ -1074,7 +1042,10 @@ class ShuffledRDD(RDD):
 
     def compute(self, split):
         if not self.sort_shuffle:
-            merger = Merger(self)
+            if isinstance(self.aggregator, GroupByAggregator):
+                merger = OrderedMerger(self.aggregator)
+            else:
+                merger = Merger(self.aggregator)
             fetcher = env.shuffleFetcher
             fetcher.fetch(self.shuffleId, split.index, merger.merge)
         else:
@@ -1083,7 +1054,7 @@ class ShuffledRDD(RDD):
             if self.iter_values:
                 merger = SortedGroupMerger(self.scope.call_site)
             else:
-                merger = SortedMerger(self)
+                merger = SortedMerger(self.aggregator)
             merger.merge(iters)
 
         return merger
@@ -1224,13 +1195,13 @@ class CoGroupedRDD(RDD):
                                                if isinstance(dep, NarrowCoGroupSplitDep)], [])
 
     def _compute_hash_merge(self, split):
-        m = CoGroupMerger(self)
+        m = OrderedCoGroupMerger(self.size)
         for i, dep in enumerate(split.deps):
             if isinstance(dep, NarrowCoGroupSplitDep):
                 m.append(i, dep.rdd.iterator(dep.split))
             elif isinstance(dep, ShuffleCoGroupSplitDep):
-                def merge(items):
-                    m.extend(i, items)
+                def merge(items, map_id):
+                    m.extend(i, items, map_id)
                 env.shuffleFetcher.fetch(dep.shuffleId, split.index, merge)
         return m
 
@@ -1562,23 +1533,6 @@ class TextFileRDD(RDD):
                 self._preferred_locs[split] = hostnames
         self.repr_name = '<%s %s>' % (self.__class__.__name__, path)
 
-    def _get_scope(self):
-        stack = traceback.extract_stack(sys._getframe())
-        self.scope = Scope()
-        for i in range(0, len(stack)):
-            if 'dpark/context.py' in stack[i][STACK_FILE_NAME]:
-                self.scope.__name__ = stack[i][STACK_FUNC_NAME]
-                if i > 0:
-                    self.scope.call_site = '%s in %s:%s' % \
-                                           (self.scope.__name__,
-                                            stack[i - 1][STACK_FILE_NAME],
-                                            str(stack[i - 1][STACK_LINE_NUM]))
-                else:
-                    self.scope.call_site = '<root>'
-                break
-        if not self.scope.__name__:
-            super(TextFileRDD, self)._get_scope()
-
     def open_file(self):
         return open_file(self.path)
 
@@ -1691,7 +1645,6 @@ class TfrecordsRDD(TextFileRDD):
                 logger.error("data loss!!!")  # Note: Pending
         else:
             return None
-
 
 class PartialTextFileRDD(TextFileRDD):
     def __init__(self, ctx, path, firstPos, lastPos, splitSize=None, numSplits=None):
@@ -2134,7 +2087,6 @@ class OutputTfrecordstFileRDD(OutputTextFileRDD):
             if not six.PY2:
                 f.close()
         return not empty
-
 
 class MultiOutputTextFileRDD(OutputTextFileRDD):
     MAX_OPEN_FILES = 512
