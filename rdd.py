@@ -313,6 +313,8 @@ class RDD(object):
                     return [reduce(f, it)]
                 except TypeError as e:
                     empty_msg = 'reduce() of empty sequence with no initial value'
+                    if not six.PY2:
+                        e.message = str(e)
                     if e.message == empty_msg:
                         return []
                     else:
@@ -1579,14 +1581,39 @@ class TfrecordsRDD(TextFileRDD):
     def compute(self, split):
         with closing(self.open_file()) as f:
             if self.path.endswith('.gz'):
-                for fh in gzip_decompressed_fh(f, self.path, split, self.splitSize):
-                    for rcd in self.compute_with_fh(fh, 0, float('inf')):
-                        yield rcd
+                first_record_founded = False
+                cross_record = None
+                block_point = None
+                for block_io in gzip_decompressed_fh(f, self.path, split, self.splitSize):
+                    block_point = self.check_block_split_point(block_io)
+                    if block_point is not None:
+                        if first_record_founded:
+                            block_io.seek(block_point)
+                            if cross_record is None:
+                                cross_record = block_io.read()
+                            else:
+                                cross_record += block_io.read()
+                                while True:
+                                    record = self.get_single_record(BytesIO(cross_record))
+                                    if record is None:
+                                        break
+                                    yield record
+                                cross_record = None
+                        else:
+                            first_record_founded = True
+                    else:
+                        if first_record_founded:
+                            cross_record += block_io.read()
+                        else:
+                            continue
             else:
                 start = split.begin
                 end = split.end
                 for rcd in self.compute_with_fh(f, start, end):
                     yield rcd
+
+    def check_block_split_point(self, block_io):
+        pass
 
     def compute_with_fh(self, f, start, end):
         if start >= 0:
@@ -1640,8 +1667,10 @@ class TfrecordsRDD(TextFileRDD):
             data, data_mask_expected = struct.unpack('<%dsI' % length, buf)
             data_mask_actual = masked_crc32c(data)
             if data_mask_actual == data_mask_expected:
-                return data.decode()
+                return data.decode(), True
             else:
+                if self.path.endswith('.gz'):
+                    return data.decode(), False
                 logger.error("data loss!!!")  # Note: Pending
         else:
             return None
