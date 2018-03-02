@@ -34,7 +34,8 @@ except ImportError:
 from dpark.dependency import *
 from dpark.util import (
     spawn, chain, mkdir_p, recurion_limit_breaker, atomic_file,
-    AbortFileReplacement, get_logger, portable_hash, Scope, masked_crc32c, gzip_decompressed_fh
+    AbortFileReplacement, get_logger, portable_hash, Scope, masked_crc32c,
+    gzip_decompressed_fh, gzip_decompressed_fh_2, gzip_find_block
 )
 from dpark.shuffle import (
     Merger, CoGroupMerger, SortedShuffleFetcher, SortedMerger, CoGroupSortedMerger,
@@ -1581,39 +1582,44 @@ class TfrecordsRDD(TextFileRDD):
     def compute(self, split):
         with closing(self.open_file()) as f:
             if self.path.endswith('.gz'):
-                first_record_founded = False
-                cross_record = None
-                block_point = None
-                for block_io in gzip_decompressed_fh(f, self.path, split, self.splitSize):
-                    block_point = self.check_block_split_point(block_io)
-                    if block_point is not None:
-                        if first_record_founded:
-                            block_io.seek(block_point)
-                            if cross_record is None:
-                                cross_record = block_io.read()
-                            else:
-                                cross_record += block_io.read()
-                                while True:
-                                    record = self.get_single_record(BytesIO(cross_record))
-                                    if record is None:
-                                        break
-                                    yield record
-                                cross_record = None
-                        else:
-                            first_record_founded = True
+                # compute the start & end boundary of gzip file (cut block)
+                if split.index == 0:
+                    zf = gzip.GzipFile(mode='rb', fileobj=f)
+                    if hasattr(zf, '_buffer'):
+                        zf._buffer.raw._read_gzip_header()
                     else:
-                        if first_record_founded:
-                            cross_record += block_io.read()
-                        else:
-                            continue
+                        zf._read_gzip_header()
+                    zf.close()
+                    start = f.tell()
+                else:
+                    start = gzip_find_block(f, split.index * self.splitSize)
+                    if start >= split.index * self.splitSize + self.splitSize:
+                        return
+                end = gzip_find_block(f, split.index * self.splitSize + self.splitSize)
+
+                f.seek(start)
+                f.length = end
+                cross_record = BytesIO()
+                for fh in gzip_decompressed_fh_2(f, self.path):
+                    point = self.check_block_split_point(fh)
+                    fh.seek(0)      # speed up
+                    if point is None:
+                        cross_record.write(fh.read())
+                    else:
+                        cross_record.write(fh.read(point))
+                        cross_record.seek(0)
+                        for rcd in self.compute_with_fh(cross_record, 0, float('inf')):
+                            yield rcd
+                        cross_record.seek(0)    # speed up
+                        cross_record.truncate()     # clear the buffer
+                        cross_record.write(fh.read())   # write next record head
+                        if f.tell() > end:
+                            break
             else:
                 start = split.begin
                 end = split.end
                 for rcd in self.compute_with_fh(f, start, end):
                     yield rcd
-
-    def check_block_split_point(self, block_io):
-        pass
 
     def compute_with_fh(self, f, start, end):
         if start >= 0:
@@ -1638,6 +1644,16 @@ class TfrecordsRDD(TextFileRDD):
                 return
             yield record
             start += len(record) + 16
+
+    def check_block_split_point(self, f):
+        buffer = f.read()   # speed up
+        cursor = 0
+        while cursor < len(buffer) - 11 and not self.check_split_point(buffer[cursor:cursor + 12]):
+            cursor += 1
+        if cursor == len(buffer) - 11:
+            return None
+        else:
+            return cursor
 
     def check_split_point(self, buf):
         buf_length_expected = 12
@@ -1667,10 +1683,8 @@ class TfrecordsRDD(TextFileRDD):
             data, data_mask_expected = struct.unpack('<%dsI' % length, buf)
             data_mask_actual = masked_crc32c(data)
             if data_mask_actual == data_mask_expected:
-                return data.decode(), True
+                return data.decode()
             else:
-                if self.path.endswith('.gz'):
-                    return data.decode(), False
                 logger.error("data loss!!!")  # Note: Pending
         else:
             return None
