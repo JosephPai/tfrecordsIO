@@ -12,6 +12,7 @@ import logging
 import os.path
 import gzip
 import zlib
+import struct
 from contextlib import contextmanager
 from zlib import compress as _compress
 try:
@@ -342,6 +343,34 @@ def gzip_find_block(f, pos):
             pass
 
 logger = get_logger(__name__)
+
+
+def gzip_decompressed_fh_2(f, path):
+    dz = zlib.decompressobj(-zlib.MAX_WBITS)
+    while True:
+        d = f.read(32 << 10)       # the same as the block size in gzip_find_block()
+        if not d:
+            break
+        try:
+            io = BytesIO(dz.decompress(d))
+        except Exception as e:
+            logger.error("failed to decompress file: %s", path)
+            old = f.tell()
+            start = gzip_find_block(f, old)
+            f.seek(start)
+            logger.error("drop corrupted block (%d bytes) in %s",
+                         start - old + len(d), path)
+            continue
+        if len(dz.unused_data) > 8:
+            f.seek(-len(dz.unused_data) + 8, 1)
+            zf = gzip.GzipFile(mode='r', fileobj=f)
+            if hasattr(zf, '_buffer'):
+                zf._buffer.raw._read_gzip_header()
+            else:
+                zf._read_gzip_header()
+            zf.close()
+            dz = zlib.decompressobj(-zlib.MAX_WBITS)
+        yield io
 
 
 def gzip_decompressed_fh(f, path, split, splitSize):
